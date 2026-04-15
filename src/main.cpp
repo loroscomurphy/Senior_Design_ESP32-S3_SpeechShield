@@ -34,7 +34,7 @@
 #define AUDIO_BUFFER_LEN    16000
 #define USE_TFLITE_MODEL    true
 
-// 1. Noise Gate: We are checking against the REAL energy, but printing a scaled version.
+// 1. Noise Gate: We are checking against the REAL energy, but printing a scaled version when debugging.
 #define NOISE_GATE_THRESH   0.000001f // Equivalent to an "Energy Score" of 6.0
 // 2. AI Threshold
 #define ACTIVE_SPEECH_THRESH 0.80f  
@@ -80,7 +80,7 @@ static bool compute_features() {
     }
     float avg_energy = total_energy / AUDIO_BUFFER_LEN;
     
-    Serial.printf("[DSP] Energy Score: %.2f\n", avg_energy * 1000000.0f);
+    //Serial.printf("[DSP] Energy Score: %.2f\n", avg_energy * 1000000.0f); //Debugging: Print a scaled version of the energy for easier reading.
 
     if (avg_energy < NOISE_GATE_THRESH) {
         return false; // Room is entirely quiet
@@ -122,12 +122,12 @@ static bool compute_features() {
         }
     }
     
-    Serial.printf("[DSP] Sustained Frames: %d / 32\n", active_frames);
+   // Serial.printf("[DSP] Sustained Frames: %d / 32\n", active_frames); //Debugging: Print how many frames were active to see if the transient filter is working.
 
     // NEW: The "Clap / Snap" Filter
     // If the sound didn't last for at least 5 frames, it's not speech.
     if (active_frames < 5) {
-        Serial.println("[GATE] Transient Noise Ignored (Clap/Snap/Click).");
+       // Serial.println("[GATE] Transient Noise Ignored (Clap/Snap/Click)."); //Debugging: Log when the transient filter is preventing inference to verify it's working.
         return false;
     }
 
@@ -141,11 +141,21 @@ void setup() {
     delay(1000);
 
     // Memory Allocation (PSRAM Fix)
+    //If debugging, make sure to uncomment each Serial.println() in this section to verify whether PSRAM is working correctly, and to see the difference in available memory.
     audio_buffer = (int16_t*)heap_caps_malloc(AUDIO_BUFFER_LEN * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    
     if (!audio_buffer) {
-        audio_buffer = (int16_t*)malloc(AUDIO_BUFFER_LEN * sizeof(int16_t));
+        //Serial.println("[MEM] WARNING: PSRAM failed, using internal heap!"); //Debugging: Log whether PSRAM is working to verify memory is being allocated correctly.
+        audio_buffer = (int16_t*)malloc(AUDIO_BUFFER_LEN * sizeof(int16_t)); // Fall back to internal memory if PSRAM allocation fails
+    } else {
+        // This prints if PSRAM IS working
+       // Serial.println("[MEM] SUCCESS: Audio buffer moved to PSRAM (32KB internal DRAM freed)."); //Debugging: Log whether PSRAM is working to verify memory is being allocated correctly.
     }
 
+    if (!audio_buffer) {
+        //Serial.println("[MEM] FATAL: Memory allocation failed entirely!"); //Debugging: Log if memory allocation failed completely, which would be a critical error.
+        while(1) delay(1000);
+    }
     // AD9833 Init
     SPI.begin(CLK_PIN, -1, DAT_PIN, FNC_PIN);
     gen.begin();
@@ -213,7 +223,7 @@ void AITask(void* pv) {
 
     for (;;) {
         currentState = STATE_LISTENING;
-        neopixelWrite(RGB_LED_PIN, 0, 0, 20);   // Blue = listening
+        neopixelWrite(RGB_LED_PIN, 0, 0, 20);   // Blue = listening/static
         vTaskDelay(pdMS_TO_TICKS(50));
         i2s_zero_dma_buffer(I2S_NUM_0);
 
@@ -229,23 +239,22 @@ void AITask(void* pv) {
             }
         } else {
             speech_prob = 0.0f; 
-            Serial.println("[GATE] Silence detected, skipping inference.");
+           // Serial.println("[GATE] Silence detected, skipping inference."); //Debugging: Log when the noise gate is preventing inference to verify it's working.
         }
 #endif
 
         if (speech_prob > 0.0f) {
-            Serial.printf("[VAD] prob=%.3f\n", speech_prob);
+           // Serial.printf("[VAD] prob=%.3f\n", speech_prob); //Debugging: Print the raw probability from the AI to see how close it is to the threshold and verify it's working.
         }
 
         if (speech_prob > ACTIVE_SPEECH_THRESH) {
             jammerAllowed.store(true);
             lastSpeechTime = millis();
             neopixelWrite(RGB_LED_PIN, 100, 0, 0);  // Red = jamming
-            Serial.println(">>> SPEECH DETECTED! JAMMING! <<<");
+            // Serial.println(">>> SPEECH DETECTED! JAMMING! <<<"); //Debugging: Log when speech is detected to verify the system is responding to the AI.
             vTaskDelay(pdMS_TO_TICKS(5000));
         } else if (millis() - lastSpeechTime > 3000) {
             jammerAllowed.store(false);
-            //neopixelWrite(RGB_LED_PIN, 0, 10, 0);   // Green = idle
             vTaskDelay(pdMS_TO_TICKS(200));
         }
     }

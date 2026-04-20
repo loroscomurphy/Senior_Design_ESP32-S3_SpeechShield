@@ -98,10 +98,11 @@ static bool compute_features() {
         float frame_energy_sum = 0.0f; // Track energy of this specific slice
 
         for (int band = 0; band < kVadMfccFeatures; band++) {
-            float energy = 0.0f;
-            int band_start = (band * frame_length) / (kVadMfccFeatures * 2);
-            int band_end = ((band + 1) * frame_length) / (kVadMfccFeatures * 2);
+            float energy = 0.0f; // Calculate energy for this specific band/slice to apply the transient filter on it
+            int band_start = (band * frame_length) / (kVadMfccFeatures * 2); // Each band gets a fraction of the frame, we calculate the energy for that fraction to see if it's just a transient spike or sustained sound. The division by 2 is because we only use the left channel and want to split the frame into equal parts for each MFCC feature.
+            int band_end = ((band + 1) * frame_length) / (kVadMfccFeatures * 2); // We calculate the energy for this specific band/slice to see if it's just a transient spike or sustained sound. The division by 2 is because we only use the left channel and want to split the frame into equal parts for each MFCC feature.
 
+            // Calculate energy for this specific band/slice to apply the transient filter on it. If the energy is very low, it might be just a transient spike and we don't want the AI to analyze it as speech.
             for (int i = band_start; i < band_end && (start + i) < AUDIO_BUFFER_LEN; i++) {
                 float sample = audio_buffer[start + i] / 32768.0f;
                 energy += sample * sample;
@@ -191,7 +192,7 @@ void setup() {
 
     // Start Dual Cores
     xTaskCreatePinnedToCore(JammerTask, "Jammer", 4096,  NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(AITask,     "Brain",  14000, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(AITask,     "Brain",  14000, NULL, 1, NULL, 0); 
 }
 
 void loop() { vTaskDelete(NULL); }
@@ -247,12 +248,13 @@ void AITask(void* pv) {
            // Serial.printf("[VAD] prob=%.3f\n", speech_prob); //Debugging: Print the raw probability from the AI to see how close it is to the threshold and verify it's working.
         }
 
+        // Decision Logic
         if (speech_prob > ACTIVE_SPEECH_THRESH) {
             jammerAllowed.store(true);
             lastSpeechTime = millis();
             neopixelWrite(RGB_LED_PIN, 100, 0, 0);  // Red = jamming
             // Serial.println(">>> SPEECH DETECTED! JAMMING! <<<"); //Debugging: Log when speech is detected to verify the system is responding to the AI.
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            vTaskDelay(pdMS_TO_TICKS(600000)); //Jam for a long time, the jammer will be turned off by the timer below after the speech ends.
         } else if (millis() - lastSpeechTime > 3000) {
             jammerAllowed.store(false);
             vTaskDelay(pdMS_TO_TICKS(200));

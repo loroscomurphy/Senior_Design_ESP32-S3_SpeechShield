@@ -73,13 +73,14 @@ static bool compute_features() {
 
     // 2. GLOBAL NOISE GATE CHECK
     float total_energy = 0.0f;
-    for (int i = 0; i < AUDIO_BUFFER_LEN; i++) {
+    for (int i = 0; i < AUDIO_BUFFER_LEN; i++) 
+    {
         audio_buffer[i] -= mean; 
         float s = audio_buffer[i] / 32768.0f;
         total_energy += s * s;
     }
-    float avg_energy = total_energy / AUDIO_BUFFER_LEN;
-    
+
+    float avg_energy = total_energy / AUDIO_BUFFER_LEN; // This is the "Energy Score" that we will use for the noise gate.
     //Serial.printf("[DSP] Energy Score: %.2f\n", avg_energy * 1000000.0f); //Debugging: Print a scaled version of the energy for easier reading.
 
     if (avg_energy < NOISE_GATE_THRESH) {
@@ -97,13 +98,15 @@ static bool compute_features() {
         int start = frame * hop;
         float frame_energy_sum = 0.0f; // Track energy of this specific slice
 
-        for (int band = 0; band < kVadMfccFeatures; band++) {
+        for (int band = 0; band < kVadMfccFeatures; band++) 
+        {
             float energy = 0.0f; // Calculate energy for this specific band/slice to apply the transient filter on it
             int band_start = (band * frame_length) / (kVadMfccFeatures * 2); // Each band gets a fraction of the frame, we calculate the energy for that fraction to see if it's just a transient spike or sustained sound. The division by 2 is because we only use the left channel and want to split the frame into equal parts for each MFCC feature.
             int band_end = ((band + 1) * frame_length) / (kVadMfccFeatures * 2); // We calculate the energy for this specific band/slice to see if it's just a transient spike or sustained sound. The division by 2 is because we only use the left channel and want to split the frame into equal parts for each MFCC feature.
 
             // Calculate energy for this specific band/slice to apply the transient filter on it. If the energy is very low, it might be just a transient spike and we don't want the AI to analyze it as speech.
-            for (int i = band_start; i < band_end && (start + i) < AUDIO_BUFFER_LEN; i++) {
+            for (int i = band_start; i < band_end && (start + i) < AUDIO_BUFFER_LEN; i++) 
+            {
                 float sample = audio_buffer[start + i] / 32768.0f;
                 energy += sample * sample;
             }
@@ -118,7 +121,8 @@ static bool compute_features() {
         
         // NEW: Check if this specific fraction of a second is loud
         float avg_frame_energy = frame_energy_sum / frame_length;
-        if (avg_frame_energy > NOISE_GATE_THRESH) {
+        if (avg_frame_energy > NOISE_GATE_THRESH) 
+        {
             active_frames++;
         }
     }
@@ -140,6 +144,8 @@ static bool compute_features() {
 void setup() {
     Serial.begin(115200);
     delay(1000);
+
+    neopixelWrite(RGB_LED_PIN, 0, 0, 0); // Start with the LED off: Just in case
 
     // Memory Allocation (PSRAM Fix)
     //If debugging, make sure to uncomment each Serial.println() in this section to verify whether PSRAM is working correctly, and to see the difference in available memory.
@@ -174,11 +180,12 @@ void setup() {
         .dma_buf_len          = I2S_BUFFER_SIZE,
         .use_apll             = false
     };
+
     i2s_pin_config_t pin_cfg = {.bck_io_num = I2S_SCK_PIN, .ws_io_num = I2S_WS_PIN, .data_out_num = -1, .data_in_num = I2S_SD_PIN};
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_cfg);
 
-    // TFLite Init
+// TFLite Init
 #if USE_TFLITE_MODEL
     const tflite::Model* model = tflite::GetModel(vad_model_data);
     static tflite::MicroErrorReporter error_reporter;
@@ -203,13 +210,17 @@ void loop() { vTaskDelete(NULL); }
 void JammerTask(void* pv) {
     float currentFreq = 20000.0f;
     for (;;) {
+        // If jamming is allowed and we're in the jamming state, generate the tone. Otherwise, turn off the tone and sleep to save power.
         if (jammerAllowed.load() && currentState == STATE_JAMMING) {
             gen.setWave(AD9833_SINE);
             gen.setFrequency(currentFreq, 0);
             currentFreq += 25.0f;
             if (currentFreq > 25000.0f) currentFreq = 20000.0f;
             delayMicroseconds(600);
-        } else {
+        } 
+        else 
+        {
+            // If we're not allowed to jam, or if we're in the listening state, make sure the tone is off and sleep for a bit to save power.
             gen.setWave(AD9833_OFF);
             vTaskDelay(pdMS_TO_TICKS(20));
         }
@@ -222,9 +233,10 @@ void JammerTask(void* pv) {
 void AITask(void* pv) {
     size_t bytesRead;
 
-    for (;;) {
+    for (;;) 
+    {
         currentState = STATE_LISTENING;
-        neopixelWrite(RGB_LED_PIN, 0, 0, 20);   // Blue = listening/static
+        //neopixelWrite(RGB_LED_PIN, 0, 0, 20);   // Blue = listening/static: Visual indicator that the system is listening
         vTaskDelay(pdMS_TO_TICKS(50));
         i2s_zero_dma_buffer(I2S_NUM_0);
 
@@ -233,29 +245,43 @@ void AITask(void* pv) {
         currentState = STATE_JAMMING;
         float speech_prob = 0.0f;
 
-#if USE_TFLITE_MODEL
-        if (compute_features()) {
-            if (interpreter->Invoke() == kTfLiteOk) {
-                speech_prob = (output_tensor->data.int8[0] - kVadOutputZeroPoint) * kVadOutputScale;
-            }
-        } else {
-            speech_prob = 0.0f; 
-           // Serial.println("[GATE] Silence detected, skipping inference."); //Debugging: Log when the noise gate is preventing inference to verify it's working.
-        }
-#endif
+        #if USE_TFLITE_MODEL
+            if (compute_features()) 
+            {
+                if (interpreter->Invoke() == kTfLiteOk) 
+                {
+                    speech_prob = (output_tensor->data.int8[0] - kVadOutputZeroPoint) * kVadOutputScale;
+                }
+            } 
+                //Debugging: TO check if the noise gate is working. Will print when silence is detected
+                /*else 
+                {
+                    speech_prob = 0.0f; 
+                    Serial.println("[GATE] Silence detected, skipping inference.");
+                }
+                */
+        #endif
 
-        if (speech_prob > 0.0f) {
-           // Serial.printf("[VAD] prob=%.3f\n", speech_prob); //Debugging: Print the raw probability from the AI to see how close it is to the threshold and verify it's working.
+        //Debugging: Will print the speech probability every time
+        /*
+        if (speech_prob > 0.0f) 
+        {
+           Serial.printf("[VAD] prob=%.3f\n", speech_prob); 
         }
+        */
 
         // Decision Logic
-        if (speech_prob > ACTIVE_SPEECH_THRESH) {
+        if (speech_prob > ACTIVE_SPEECH_THRESH) 
+        {
             jammerAllowed.store(true);
             lastSpeechTime = millis();
-            neopixelWrite(RGB_LED_PIN, 100, 0, 0);  // Red = jamming
+            //neopixelWrite(RGB_LED_PIN, 100, 0, 0);  // Red = jamming: Visual indicator that speech was detected.
             // Serial.println(">>> SPEECH DETECTED! JAMMING! <<<"); //Debugging: Log when speech is detected to verify the system is responding to the AI.
             vTaskDelay(pdMS_TO_TICKS(600000)); //Jam for a long time, the jammer will be turned off by the timer below after the speech ends.
-        } else if (millis() - lastSpeechTime > 3000) {
+        } 
+        else if (millis() - lastSpeechTime > 3000) 
+        {
+            // If no speech has been detected for 3 seconds, turn off the jammer to save power.
             jammerAllowed.store(false);
             vTaskDelay(pdMS_TO_TICKS(200));
         }

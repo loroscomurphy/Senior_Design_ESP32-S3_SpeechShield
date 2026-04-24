@@ -63,80 +63,125 @@ void JammerTask(void* pv);
 void AITask(void* pv);
 
 // =============================================================================
-// MFCC EXTRACTION (WITH TRANSIENT NOISE FILTER)
+// FFT — Radix-2 Cooley-Tukey with precomputed twiddle factors and Hanning window
+// =============================================================================
+static float tw_re[kVadFftSize / 2];
+static float tw_im[kVadFftSize / 2];
+static float hann[kVadFftSize];
+static float fft_buf_re[kVadFftSize];
+static float fft_buf_im[kVadFftSize];
+
+static void fft_init() {
+    for (int k = 0; k < kVadFftSize / 2; ++k) {
+        const float ang = -2.0f * 3.14159265f * k / kVadFftSize;
+        tw_re[k] = cosf(ang);
+        tw_im[k] = sinf(ang);
+    }
+    for (int n = 0; n < kVadFftSize; ++n)
+        hann[n] = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * n / (kVadFftSize - 1)));
+}
+
+static void fft_run() {
+    // Bit-reversal permutation
+    for (int i = 1, j = 0; i < kVadFftSize; ++i) {
+        int bit = kVadFftSize >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float t = fft_buf_re[i]; fft_buf_re[i] = fft_buf_re[j]; fft_buf_re[j] = t;
+            t = fft_buf_im[i]; fft_buf_im[i] = fft_buf_im[j]; fft_buf_im[j] = t;
+        }
+    }
+    // Butterfly passes (no trig in inner loop — uses precomputed twiddles)
+    for (int len = 2; len <= kVadFftSize; len <<= 1) {
+        const int stride = kVadFftSize / len;
+        for (int i = 0; i < kVadFftSize; i += len) {
+            for (int j = 0; j < len / 2; ++j) {
+                const int a = i + j, b = i + j + len / 2;
+                const float wr = tw_re[j * stride], wi = tw_im[j * stride];
+                const float vr = wr * fft_buf_re[b] - wi * fft_buf_im[b];
+                const float vi = wr * fft_buf_im[b] + wi * fft_buf_re[b];
+                fft_buf_re[b] = fft_buf_re[a] - vr;
+                fft_buf_im[b] = fft_buf_im[a] - vi;
+                fft_buf_re[a] += vr;
+                fft_buf_im[a] += vi;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// MFCC EXTRACTION
 // =============================================================================
 static bool compute_features() {
-    // 1. DC OFFSET REMOVAL
-    long sum = 0;
-    for (int i = 0; i < AUDIO_BUFFER_LEN; i++) sum += audio_buffer[i];
-    int16_t mean = sum / AUDIO_BUFFER_LEN;
-
-    // 2. GLOBAL NOISE GATE CHECK
+    // Noise gate
     float total_energy = 0.0f;
-    for (int i = 0; i < AUDIO_BUFFER_LEN; i++) 
-    {
-        audio_buffer[i] -= mean; 
-        float s = audio_buffer[i] / 32768.0f;
+    for (int i = 0; i < AUDIO_BUFFER_LEN; ++i) {
+        float s = static_cast<float>(audio_buffer[i]);
         total_energy += s * s;
     }
+    if ((total_energy / AUDIO_BUFFER_LEN) < NOISE_GATE_THRESH) return false;
 
-    float avg_energy = total_energy / AUDIO_BUFFER_LEN; // This is the "Energy Score" that we will use for the noise gate.
-    //Serial.printf("[DSP] Energy Score: %.2f\n", avg_energy * 1000000.0f); //Debugging: Print a scaled version of the energy for easier reading.
+    float mag[257];
+    float log_mel[kVadMfccFeatures];
 
-    if (avg_energy < NOISE_GATE_THRESH) {
-        return false; // Room is entirely quiet
-    }
+    // Mel scale helpers
+    auto hz_to_mel = [](float f) { return 2595.0f * log10f(1.0f + f / 700.0f); };
+    auto mel_to_hz = [](float m) { return 700.0f * (powf(10.0f, m / 2595.0f) - 1.0f); };
 
-    // 3. FEATURE EXTRACTION & TRANSIENT FILTER
-    int frame_length = kVadFftSize;
-    int hop = kVadHopLength;
-    
-    // NEW: Counter to track how long the sound lasts
-    int active_frames = 0; 
+    // 15 mel boundary points (13 filters need 13+2 boundaries)
+    float mel_hz[15];
+    const float mel_min = hz_to_mel(0.0f);
+    const float mel_max = hz_to_mel(8000.0f);
+    const float mel_step = (mel_max - mel_min) / 14.0f;
+    for (int i = 0; i < 15; ++i)
+        mel_hz[i] = mel_to_hz(mel_min + mel_step * i);
 
-    for (int frame = 0; frame < kVadTimeFrames; frame++) {
-        int start = frame * hop;
-        float frame_energy_sum = 0.0f; // Track energy of this specific slice
+    const float bin_scale = static_cast<float>(kVadFftSize) / 16000.0f;
+    auto get_bin = [&](float hz) { return static_cast<int>(hz * bin_scale + 0.5f); };
 
-        for (int band = 0; band < kVadMfccFeatures; band++) 
-        {
-            float energy = 0.0f; // Calculate energy for this specific band/slice to apply the transient filter on it
-            int band_start = (band * frame_length) / (kVadMfccFeatures * 2); // Each band gets a fraction of the frame, we calculate the energy for that fraction to see if it's just a transient spike or sustained sound. The division by 2 is because we only use the left channel and want to split the frame into equal parts for each MFCC feature.
-            int band_end = ((band + 1) * frame_length) / (kVadMfccFeatures * 2); // We calculate the energy for this specific band/slice to see if it's just a transient spike or sustained sound. The division by 2 is because we only use the left channel and want to split the frame into equal parts for each MFCC feature.
+    for (int frame = 0; frame < kVadTimeFrames; ++frame) {
+        const int start = frame * kVadHopLength;
 
-            // Calculate energy for this specific band/slice to apply the transient filter on it. If the energy is very low, it might be just a transient spike and we don't want the AI to analyze it as speech.
-            for (int i = band_start; i < band_end && (start + i) < AUDIO_BUFFER_LEN; i++) 
-            {
-                float sample = audio_buffer[start + i] / 32768.0f;
-                energy += sample * sample;
-            }
-            
-            frame_energy_sum += energy; // Accumulate the slice's total energy
-
-            // Log compression & Quantization
-            float value = logf(energy + 1e-6f);
-            int q = (int)(value / kVadInputScale + kVadInputZeroPoint);
-            input_tensor->data.int8[frame * kVadMfccFeatures + band] = (int8_t)constrain(q, -128, 127);
+        // FFT magnitude — O(N log N)
+        for (int n = 0; n < kVadFftSize; ++n) {
+            fft_buf_re[n] = static_cast<float>(audio_buffer[start + n]) * hann[n];
+            fft_buf_im[n] = 0.0f;
         }
-        
-        // NEW: Check if this specific fraction of a second is loud
-        float avg_frame_energy = frame_energy_sum / frame_length;
-        if (avg_frame_energy > NOISE_GATE_THRESH) 
-        {
-            active_frames++;
+        fft_run();
+        for (int k = 0; k <= 256; ++k)
+            mag[k] = sqrtf(fft_buf_re[k] * fft_buf_re[k] + fft_buf_im[k] * fft_buf_im[k]);
+
+        // Mel filterbank
+        for (int m = 0; m < kVadMfccFeatures; ++m) {
+            int lo = get_bin(mel_hz[m]);
+            int mid = get_bin(mel_hz[m + 1]);
+            int hi = get_bin(mel_hz[m + 2]);
+            lo  = constrain(lo,  0, 256);
+            mid = constrain(mid, 0, 256);
+            hi  = constrain(hi,  0, 256);
+            float sum = 0.0f;
+            if (mid > lo)
+                for (int k = lo; k <= mid; ++k)
+                    sum += mag[k] * static_cast<float>(k - lo) / static_cast<float>(mid - lo);
+            if (hi > mid)
+                for (int k = mid + 1; k <= hi; ++k)
+                    sum += mag[k] * static_cast<float>(hi - k) / static_cast<float>(hi - mid);
+            log_mel[m] = logf(sum + 1e-6f);
+        }
+
+        // DCT-II
+        const float pi_over_2m = 3.14159265f / (2.0f * kVadMfccFeatures);
+        for (int i = 0; i < kVadMfccFeatures; ++i) {
+            float s = 0.0f;
+            for (int j = 0; j < kVadMfccFeatures; ++j)
+                s += log_mel[j] * cosf(pi_over_2m * i * (2.0f * j + 1.0f));
+            const int q = static_cast<int>(s / kVadInputScale + kVadInputZeroPoint);
+            input_tensor->data.int8[frame * kVadMfccFeatures + i] = (int8_t)constrain(q, -128, 127);
         }
     }
-    
-   // Serial.printf("[DSP] Sustained Frames: %d / 32\n", active_frames); //Debugging: Print how many frames were active to see if the transient filter is working.
 
-    // NEW: The "Clap / Snap" Filter
-    // If the sound didn't last for at least 5 frames, it's not speech.
-    if (active_frames < 5) {
-       // Serial.println("[GATE] Transient Noise Ignored (Clap/Snap/Click)."); //Debugging: Log when the transient filter is preventing inference to verify it's working.
-        return false;
-    }
-
-    return true; // Sustained sound detected, let the AI analyze it!
+    return true;
 }
 // =============================================================================
 // SETUP
@@ -184,6 +229,9 @@ void setup() {
     i2s_pin_config_t pin_cfg = {.bck_io_num = I2S_SCK_PIN, .ws_io_num = I2S_WS_PIN, .data_out_num = -1, .data_in_num = I2S_SD_PIN};
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_cfg);
+
+    // FFT Init (precomputes twiddle factors + Hanning window)
+    fft_init();
 
 // TFLite Init
 #if USE_TFLITE_MODEL
@@ -271,17 +319,16 @@ void AITask(void* pv) {
         */
 
         // Decision Logic
-        if (speech_prob > ACTIVE_SPEECH_THRESH) 
+        if (speech_prob > ACTIVE_SPEECH_THRESH)
         {
             jammerAllowed.store(true);
             lastSpeechTime = millis();
             //neopixelWrite(RGB_LED_PIN, 100, 0, 0);  // Red = jamming: Visual indicator that speech was detected.
             // Serial.println(">>> SPEECH DETECTED! JAMMING! <<<"); //Debugging: Log when speech is detected to verify the system is responding to the AI.
-            vTaskDelay(pdMS_TO_TICKS(600000)); //Jam for a long time, the jammer will be turned off by the timer below after the speech ends.
-        } 
-        else if (millis() - lastSpeechTime > 3000) 
+        }
+        else if (millis() - lastSpeechTime > 3000)
         {
-            // If no speech has been detected for 3 seconds, turn off the jammer to save power.
+            // No speech for 3 seconds — stop jamming
             jammerAllowed.store(false);
             vTaskDelay(pdMS_TO_TICKS(200));
         }

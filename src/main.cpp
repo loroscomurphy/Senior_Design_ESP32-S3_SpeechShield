@@ -277,7 +277,7 @@ void AITask(void* pv) {
             lastSpeechTime = millis();
             //neopixelWrite(RGB_LED_PIN, 100, 0, 0);  // Red = jamming: Visual indicator that speech was detected.
             // Serial.println(">>> SPEECH DETECTED! JAMMING! <<<"); //Debugging: Log when speech is detected to verify the system is responding to the AI.
-            vTaskDelay(pdMS_TO_TICKS(600000)); //Jam for a long time, the jammer will be turned off by the timer below after the speech ends.
+            vTaskDelay(pdMS_TO_TICKS(180000)); //Jam for a long time, the jammer will be turned off by the timer below after the speech ends.
         } 
         else if (millis() - lastSpeechTime > 3000) 
         {

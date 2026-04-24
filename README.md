@@ -55,11 +55,37 @@ Quantization parameters (from `vad_model_data.h`):
 - Input: scale=`0.489906`, zero_point=`75`
 - Output: scale=`0.003906`, zero_point=`-128`
 
-The model expects true MFCCs (FFT → mel filterbank → log → DCT), not raw energy bands. See Known Issues #2.
+The model expects true MFCCs (FFT → mel filterbank → log → DCT), not raw energy bands.
 
 ---
 
 ## How It Works
+
+```mermaid
+flowchart LR
+    Mic[I2S MEMS microphone] --> Audio[I2S audio buffer<br/>16,000 samples at 16 kHz]
+
+    subgraph Core0[Core 0: AI task]
+        Audio --> Gate{Noise gate<br/>energy >= 1e-6?}
+        Gate -- No --> Skip[Skip inference]
+        Gate -- Yes --> MFCC[MFCC extraction<br/>Hanning, 512-pt FFT,<br/>mel filterbank, log, DCT-II]
+        MFCC --> Quant[Quantize to int8<br/>32 x 13 input]
+        Quant --> Model[TFLite Micro VAD model]
+        Model --> Score{Speech score > 0.80?}
+        Score -- Yes --> Allow[Set jammerAllowed = true]
+        Score -- No --> Hold[Clear after 3 seconds<br/>without speech]
+    end
+
+    subgraph Core1[Core 1: Jammer task]
+        Allow --> Check{jammerAllowed<br/>and STATE_JAMMING?}
+        Hold --> Check
+        Skip --> Check
+        Check -- Yes --> DDS[AD9833 DDS sweep<br/>20-25 kHz]
+        Check -- No --> Off[AD9833 off]
+    end
+
+    DDS --> Output[Ultrasonic transducer / output stage]
+```
 
 ```
 [I2S mic] → AITask (Core 0) → TFLite VAD → jammerAllowed flag
@@ -69,11 +95,10 @@ The model expects true MFCCs (FFT → mel filterbank → log → DCT), not raw e
 
 **AITask (Core 0)**
 1. Reads 16,000 samples (1 sec @ 16kHz, 16-bit mono) from I2S
-2. DC offset removal + noise gate (energy < 1e-6 threshold → skip)
-3. Transient filter: sound must span ≥5 frames or it's ignored (claps, snaps)
-4. MFCC features (Hanning → 512-pt FFT → mel filterbank → log → DCT-II) → quantized int8 → fed to TFLite input tensor
-5. If inference score > 0.80 → set `jammerAllowed = true`, update `lastSpeechTime`
-6. If no speech for 3s → set `jammerAllowed = false`
+2. Noise gate skips inference when average energy is below `1e-6`
+3. MFCC features (Hanning → 512-pt FFT → mel filterbank → log → DCT-II) → quantized int8 → fed to TFLite input tensor
+4. If inference score > 0.80 → set `jammerAllowed = true`, update `lastSpeechTime`
+5. If no speech for 3s → set `jammerAllowed = false`
 
 **JammerTask (Core 1)**
 - Sweeps 20,000–25,000 Hz in 25 Hz steps, 600µs per step
@@ -109,6 +134,16 @@ The TFLite model binary must be present in `include/vad_model_data.h` as a C arr
 **Noise gate** (`NOISE_GATE_THRESH = 0.000001f`): raise if triggering on HVAC/ambient noise, lower if missing soft speech. Uncomment the `[DSP] Energy Score` serial print to calibrate.
 
 **VAD threshold** (`ACTIVE_SPEECH_THRESH = 0.80f`): raise to reduce false positives, lower to catch quieter speech.
+
+---
+
+## Conclusion
+
+(Eric) The system works by keeping speech detection and signal generation on separate cores. Core 0 listens to the microphone, converts the audio into MFCC features, and runs the TFLite Micro VAD model to decide whether speech is present. Core 1 handles the AD9833 sweep, so the ultrasonic output can keep running while the AI task collects the next audio window.
+
+(Eric) The model is not making a decision from raw volume alone. The noise gate only skips very quiet input. When there is enough audio energy, the firmware builds the same type of MFCC input the model was trained on, quantizes it to int8, and checks the model's speech probability. If the score stays above the threshold, the jammer is allowed to sweep from 20 kHz to 25 kHz. If speech stops for 3 seconds, the firmware turns the sweep off.
+
+(Eric) This keeps the firmware small enough for the ESP32-S3 while still using TinyML for the speech/no-speech decision.
 
 ---
 

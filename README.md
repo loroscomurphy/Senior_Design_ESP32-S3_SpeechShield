@@ -127,6 +127,34 @@ pio device monitor --baud 115200
 
 The TFLite model binary must be present in `include/vad_model_data.h` as a C array. The constants `kVadFftSize`, `kVadHopLength`, `kVadTimeFrames`, `kVadMfccFeatures`, `kVadInputScale`, `kVadInputZeroPoint`, `kVadOutputScale`, `kVadOutputZeroPoint` must match the model's quantization parameters.
 
+## Testing
+
+### Prerequisites
+- ESP32-S3 DevKitC-1-N16R8V with PSRAM enabled in `platformio.ini`
+- All hardware assembled per the pin assignments table above
+- USB power or LiPo battery connected
+
+### Steps
+1. **Build & flash** using PlatformIO: `pio run -t upload`
+2. **Open serial monitor** at 115200 baud: `pio device monitor --baud 115200`
+3. **Boot check** — no errors in serial output. RGB LED starts off. A red LED + serial error + halt means a fatal initialization failure.
+4. **Silence test** — in a quiet room, the jammer should stay off. No `[VAD]` lines should appear in serial output since the noise gate blocks inference during silence.
+5. **Speech detection** — speak 1–2 feet from the mic. Within ~1 second you should see `[VAD] prob=0.xxxx  SPEECH!` in the serial monitor and the ultrasonic jammer (20–25 kHz) should activate.
+6. **Jammer duration** — once triggered, the jammer runs for up to 3 minutes. It stops early if you stay silent for 3 consecutive seconds.
+7. **Speech stop** — after the jammer is on, stop talking. After 3 seconds of silence the jammer should turn off.
+8. **False trigger test** — clap, snap fingers, slam doors. The transient noise filter should reject these short sounds; the jammer should NOT activate.
+
+### Serial output reference
+- `[VAD] prob=0.xxxx  SPEECH!` — speech detected, jammer is on
+- `[GATE] Silence detected, skipping inference.` — noise gate blocked inference (uncommented in debug build)
+- Red LED + serial error + halt = fatal error during setup
+
+### Tuning during testing
+- If the system triggers on ambient noise, increase `NOISE_GATE_THRESH` in `main.cpp` (default `0.000001f`). Uncomment `[DSP] Energy Score` serial print to calibrate.
+- If it misses soft speech, lower `ACTIVE_SPEECH_THRESH` (default `0.80f`). If it false-triggers on noise, raise it.
+
+---
+
 The firmware checks the MFCC frame layout at compile time:
 
 ```cpp

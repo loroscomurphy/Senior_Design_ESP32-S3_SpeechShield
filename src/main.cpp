@@ -33,9 +33,12 @@
 #define AUDIO_BUFFER_LEN    16000  
 #define USE_TFLITE_MODEL    true  
   
-// Noise gate uses actual signal energy.  
-#define NOISE_GATE_THRESH   0.000001f  
-#define ACTIVE_SPEECH_THRESH 0.80f  
+// Noise gate uses actual signal energy.
+#define NOISE_GATE_THRESH   0.000001f
+#define ACTIVE_SPEECH_THRESH 0.80f
+
+// Fallback energy threshold for speech detection (higher than noise gate)
+#define ENERGY_SPEECH_THRESH 0.01f  
   
 // =============================================================================  
 // GLOBALS (Logan)  
@@ -285,25 +288,45 @@ void AITask(void* pv) {
         i2s_read(I2S_NUM_0, audio_buffer, AUDIO_BUFFER_LEN * sizeof(int16_t),   
                 &bytesRead, portMAX_DELAY);  
   
-        currentState = STATE_JAMMING;  
-        float speech_prob = 0.0f;  
-  
-        if (USE_TFLITE_MODEL) {  
-            if (compute_features()) {  
-                if (interpreter->Invoke() == kTfLiteOk) {  
-                    speech_prob = (output_tensor->data.int8[0] - kVadOutputZeroPoint)   
-                                  * kVadOutputScale;  
-                }  
-            }  
-        }  
-  
-        if (speech_prob > ACTIVE_SPEECH_THRESH) {  
-            jammerAllowed.store(true);  
-            lastSpeechTime = millis();  
-        }   
-        else if (millis() - lastSpeechTime > 3000) {  
-            jammerAllowed.store(false);  
-            vTaskDelay(pdMS_TO_TICKS(200));  
-        }  
+        currentState = STATE_JAMMING;
+        float speech_prob = 0.0f;
+        bool use_fallback = false;
+
+        if (USE_TFLITE_MODEL) {
+            if (compute_features()) {
+                if (interpreter->Invoke() == kTfLiteOk) {
+                    speech_prob = (output_tensor->data.int8[0] - kVadOutputZeroPoint)
+                                  * kVadOutputScale;
+                } else {
+                    // TinyML inference failed - fall back to energy
+                    use_fallback = true;
+                }
+            }
+            // If TinyML disabled or compute_features failed (low energy), fall back
+        } else {
+            use_fallback = true;
+        }
+
+        if (use_fallback) {
+            // Fallback: Simple energy-based speech detection
+            float total_energy = 0.0f;
+            for (int i = 0; i < AUDIO_BUFFER_LEN; ++i) {
+                float s = static_cast<float>(audio_buffer[i]);
+                total_energy += s * s;
+            }
+            float avg_energy = total_energy / AUDIO_BUFFER_LEN;
+            if (avg_energy > ENERGY_SPEECH_THRESH) {
+                speech_prob = 1.0f;  // Force detection
+            }
+        }
+
+        if (speech_prob > ACTIVE_SPEECH_THRESH) {
+            jammerAllowed.store(true);
+            lastSpeechTime = millis();
+        }
+        else if (millis() - lastSpeechTime > 3000) {
+            jammerAllowed.store(false);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
     }  
 }  

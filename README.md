@@ -12,7 +12,7 @@ Dual-core FreeRTOS: Core 0 handles mic capture + inference, Core 1 handles the j
 |-----------|-------|
 | ESP32-S3 DevKitC-1-N16R8V | 16MB flash, 8MB PSRAM required |
 | AD9833 DDS module | SPI, generates ultrasonic sine wave |
-| I2S MEMS microphone | INMP441 or SPH0645LM4H |
+| I2S MEMS microphone | ICS43434 |
 | WS2812B RGB LED | Status indicator (currently unused in firmware) |
 | LiPo 3.7V 1000mAh+ | ~2–3 hr runtime under continuous jamming |
 | TP4056 charger module | With protection circuit |
@@ -144,6 +144,12 @@ The TFLite model binary must be present in `include/vad_model_data.h` as a C arr
 (Eric) The model is not making a decision from raw volume alone. The noise gate only skips very quiet input. When there is enough audio energy, the firmware builds the same type of MFCC input the model was trained on, quantizes it to int8, and checks the model's speech probability. If the score stays above the threshold, the jammer is allowed to sweep from 20 kHz to 25 kHz. If speech stops for 3 seconds, the firmware turns the sweep off.
 
 (Eric) This keeps the firmware small enough for the ESP32-S3 while still using TinyML for the speech/no-speech decision.
+
+## Fallback Energy-Based Detection
+
+(Eric) To ensure robustness, the system includes a fallback to simple energy-based speech detection if TinyML inference fails or is disabled. If the VAD model cannot be loaded, inference returns an error, or `USE_TFLITE_MODEL` is set to false, the firmware computes the average signal energy over the 1-second audio buffer. If this exceeds `ENERGY_SPEECH_THRESH` (default 0.01), speech is detected, and jamming is activated. This provides basic functionality without ML, though less accurate than TinyML.
+
+Tune `ENERGY_SPEECH_THRESH` by monitoring average energy during speech and noise (add Serial prints in `AITask`). Set higher to avoid false positives from ambient noise.
 
 ---
 

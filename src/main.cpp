@@ -16,12 +16,12 @@
 // =============================================================================  
 // CONFIG  
 // =============================================================================  
-#define I2S_BUFFER_SIZE     512  
-#define I2S_DMA_BUF_COUNT   4  
-#define AUDIO_BUFFER_LEN    16000  
+#define I2S_BUFFER_SIZE     512    
+#define I2S_DMA_BUF_COUNT   4      
+#define AUDIO_BUFFER_LEN    16000
 #define USE_TFLITE_MODEL    true  
   
-#define NOISE_GATE_THRESH     0.000001f  
+#define NOISE_GATE_THRESH     0.000001f // Equivalent to an "Energy Score" of 6.0
 #define ACTIVE_SPEECH_THRESH  0.80f  
 #define ENERGY_SPEECH_THRESH  0.01f        // kept for when you re-enable fallback  
   
@@ -70,116 +70,77 @@ void JammerTask(void* pv);
 void AITask(void* pv);  
   
 // =============================================================================  
-// FFT  
-// =============================================================================  
-static void fft_init() {  
-    for (int k = 0; k < kVadFftSize / 2; ++k) {  
-        const float ang = -2.0f * 3.14159265f * k / kVadFftSize;  
-        tw_re[k] = cosf(ang);  
-        tw_im[k] = sinf(ang);  
-    }  
-    for (int n = 0; n < kVadFftSize; ++n)  
-        hann[n] = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * n / (kVadFftSize - 1)));  
-}  
-  
-static void fft_run() {  
-    // Bit-reversal  
-    for (int i = 1, j = 0; i < kVadFftSize; ++i) {  
-        int bit = kVadFftSize >> 1;  
-        for (; j & bit; bit >>= 1) j ^= bit;  
-        j ^= bit;  
-        if (i < j) {  
-            float t = fft_buf_re[i]; fft_buf_re[i] = fft_buf_re[j]; fft_buf_re[j] = t;  
-            t = fft_buf_im[i]; fft_buf_im[i] = fft_buf_im[j]; fft_buf_im[j] = t;  
-        }  
-    }  
-    // Butterfly passes using precomputed twiddles  
-    for (int len = 2; len <= kVadFftSize; len <<= 1) {  
-        const int stride = kVadFftSize / len;  
-        for (int i = 0; i < kVadFftSize; i += len) {  
-            for (int j = 0; j < len / 2; ++j) {  
-                const int a = i + j, b = i + j + len / 2;  
-                const float wr = tw_re[j * stride], wi = tw_im[j * stride];  
-                const float vr = wr * fft_buf_re[b] - wi * fft_buf_im[b];  
-                const float vi = wr * fft_buf_im[b] + wi * fft_buf_re[b];  
-                fft_buf_re[b] = fft_buf_re[a] - vr;  
-                fft_buf_im[b] = fft_buf_im[a] - vi;  
-                fft_buf_re[a] += vr;  
-                fft_buf_im[a] += vi;  
-            }  
-        }  
-    }  
-}  
-  
-// =============================================================================  
-// MFCC + Noise Gate  
+// MFCC EXTRACTION (WITH TRANSIENT NOISE FILTER)  
 // =============================================================================  
 static bool compute_features() {  
+    // 1. DC OFFSET REMOVAL  
+    long sum = 0;  
+    for (int i = 0; i < AUDIO_BUFFER_LEN; i++) sum += audio_buffer[i];  
+    int16_t mean = sum / AUDIO_BUFFER_LEN;  
+  
+    // 2. GLOBAL NOISE GATE CHECK  
     float total_energy = 0.0f;  
-    for (int i = 0; i < AUDIO_BUFFER_LEN; ++i) {  
-        float s = static_cast<float>(audio_buffer[i]);  
+    for (int i = 0; i < AUDIO_BUFFER_LEN; i++) {  
+        audio_buffer[i] -= mean;  
+        float s = audio_buffer[i] / 32768.0f;  
         total_energy += s * s;  
     }  
-    if ((total_energy / AUDIO_BUFFER_LEN) < NOISE_GATE_THRESH) {  
+  
+    float avg_energy = total_energy / AUDIO_BUFFER_LEN; // This is the "Energy Score"  
+    //Serial.printf("[DSP] Energy Score: %.2f\n", avg_energy * 1000000.0f); //Debugging: Print a scaled version of the energy for easier reading.  
+  
+    if (avg_energy < NOISE_GATE_THRESH) {  
+        return false; // Room is entirely quiet  
+    }  
+  
+    // 3. FEATURE EXTRACTION & TRANSIENT FILTER  
+    int frame_length = kVadFftSize;  
+    int hop = kVadHopLength;  
+      
+    // NEW: Counter to track how long the sound lasts  
+    int active_frames = 0;  
+  
+    for (int frame = 0; frame < kVadTimeFrames; frame++) {  
+        int start = frame * hop;  
+        float frame_energy_sum = 0.0f; // Track energy of this specific slice  
+  
+        for (int band = 0; band < kVadMfccFeatures; band++) {  
+            float energy = 0.0f; // Calculate energy for this specific band/slice  
+            int band_start = (band * frame_length) / (kVadMfccFeatures * 2);  
+            int band_end = ((band + 1) * frame_length) / (kVadMfccFeatures * 2);  
+  
+            // Calculate energy for this specific band/slice to apply the transient filter  
+            for (int i = band_start; i < band_end && (start + i) < AUDIO_BUFFER_LEN; i++) {  
+                float sample = audio_buffer[start + i] / 32768.0f;  
+                energy += sample * sample;  
+            }  
+              
+            frame_energy_sum += energy; // Accumulate the slice's total energy  
+  
+            // Log compression & Quantization  
+            float value = logf(energy + 1e-6f);  
+            // FIXED: correct int8 quantization for the model  
+            int q = (int)roundf(value / kVadInputScale + kVadInputZeroPoint);  
+            input_tensor->data.int8[frame * kVadMfccFeatures + band] = (int8_t)constrain(q, -128, 127);  
+        }  
+          
+        // NEW: Check if this specific fraction of a second is loud  
+        float avg_frame_energy = frame_energy_sum / frame_length;  
+        if (avg_frame_energy > NOISE_GATE_THRESH) {  
+            active_frames++;  
+        }  
+    }  
+      
+    // Serial.printf("[DSP] Sustained Frames: %d / 32\n", active_frames); //Debugging  
+  
+    // NEW: The "Clap / Snap" Filter  
+    // If the sound didn't last for at least 5 frames, it's not speech.  
+    if (active_frames < 5) {  
+        // Serial.println("[GATE] Transient Noise Ignored (Clap/Snap/Click)."); //Debugging  
         return false;  
     }  
   
-    float mag[257];  
-    float log_mel[kVadMfccFeatures];  
-  
-    auto hz_to_mel = [](float f) { return 2595.0f * log10f(1.0f + f / 700.0f); };  
-    auto mel_to_hz = [](float m) { return 700.0f * (powf(10.0f, m / 2595.0f) - 1.0f); };  
-  
-    float mel_hz[15];  
-    const float mel_min = hz_to_mel(0.0f);  
-    const float mel_max = hz_to_mel(8000.0f);  
-    const float mel_step = (mel_max - mel_min) / 14.0f;  
-    for (int i = 0; i < 15; ++i)  
-        mel_hz[i] = mel_to_hz(mel_min + mel_step * i);  
-  
-    const float bin_scale = static_cast<float>(kVadFftSize) / 16000.0f;  
-    auto get_bin = [&](float hz) { return static_cast<int>(hz * bin_scale + 0.5f); };  
-  
-    for (int frame = 0; frame < kVadTimeFrames; ++frame) {  
-        const int start = frame * kVadHopLength;  
-  
-        for (int n = 0; n < kVadFftSize; ++n) {  
-            fft_buf_re[n] = static_cast<float>(audio_buffer[start + n]) * hann[n];  
-            fft_buf_im[n] = 0.0f;  
-        }  
-        fft_run();  
-  
-        for (int k = 0; k <= 256; ++k)  
-            mag[k] = sqrtf(fft_buf_re[k] * fft_buf_re[k] + fft_buf_im[k] * fft_buf_im[k]);  
-  
-        for (int m = 0; m < kVadMfccFeatures; ++m) {  
-            int lo  = constrain(get_bin(mel_hz[m]),     0, 256);  
-            int mid = constrain(get_bin(mel_hz[m + 1]), 0, 256);  
-            int hi  = constrain(get_bin(mel_hz[m + 2]), 0, 256);  
-  
-            float sum = 0.0f;  
-            if (mid > lo)  
-                for (int k = lo; k <= mid; ++k)  
-                    sum += mag[k] * static_cast<float>(k - lo) / static_cast<float>(mid - lo);  
-            if (hi > mid)  
-                for (int k = mid + 1; k <= hi; ++k)  
-                    sum += mag[k] * static_cast<float>(hi - k) / static_cast<float>(hi - mid);  
-  
-            log_mel[m] = logf(sum + 1e-6f);  
-        }  
-  
-        const float pi_over_2m = 3.14159265f / (2.0f * kVadMfccFeatures);  
-        for (int i = 0; i < kVadMfccFeatures; ++i) {  
-            float s = 0.0f;  
-            for (int j = 0; j < kVadMfccFeatures; ++j)  
-                s += log_mel[j] * cosf(pi_over_2m * i * (2.0f * j + 1.0f));  
-  
-            // FIXED: correct int8 quantization for the model  
-            int q = (int)roundf(s / kVadInputScale) + kVadInputZeroPoint;  
-            input_tensor->data.int8[frame * kVadMfccFeatures + i] = (int8_t)constrain(q, -128, 127);  
-        }  
-    }  
-    return true;  
+    return true; // Sustained sound detected, let the AI analyze it!  
 }  
   
 // =============================================================================  
@@ -191,7 +152,7 @@ void setup() {
     neopixelWrite(RGB_LED_PIN, 0, 0, 0);  
   
     audio_buffer = (int16_t*)heap_caps_malloc(AUDIO_BUFFER_LEN * sizeof(int16_t),  
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);  
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);  
     if (!audio_buffer) {  
         audio_buffer = (int16_t*)malloc(AUDIO_BUFFER_LEN * sizeof(int16_t));  
     }  
@@ -223,18 +184,17 @@ void setup() {
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);  
     i2s_set_pin(I2S_NUM_0, &pin_cfg);  
   
-    fft_init();  
-  
-    if (USE_TFLITE_MODEL) {  
-        const tflite::Model* model = tflite::GetModel(vad_model_data);  
-        static tflite::MicroErrorReporter error_reporter;  
-        static tflite::AllOpsResolver resolver;  
-        static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, kArenaSize, &error_reporter);  
-        interpreter = &static_interpreter;  
-        interpreter->AllocateTensors();  
-        input_tensor  = interpreter->input(0);  
-        output_tensor = interpreter->output(0);  
-    }  
+    // TFLite Init  
+#if USE_TFLITE_MODEL
+    const tflite::Model* model = tflite::GetModel(vad_model_data);  
+    static tflite::MicroErrorReporter error_reporter;  
+    static tflite::AllOpsResolver resolver;  
+    static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, kArenaSize, &error_reporter);  
+    interpreter = &static_interpreter;  
+    interpreter->AllocateTensors();  
+    input_tensor  = interpreter->input(0);  
+    output_tensor = interpreter->output(0);  
+#endif
   
     xTaskCreatePinnedToCore(JammerTask, "Jammer", 4096, NULL, 2, NULL, 1);  
     xTaskCreatePinnedToCore(AITask,     "Brain",  14000, NULL, 1, NULL, 0);  
@@ -262,7 +222,7 @@ void JammerTask(void* pv) {
 }  
   
 // =============================================================================  
-// AI TASK (Core 0) - TinyML only (fallback commented out)  
+// AI TASK (Core 0) - TinyML with transient filter + VAD debug  
 // =============================================================================  
 void AITask(void* pv) {  
     size_t bytesRead;  
@@ -272,26 +232,32 @@ void AITask(void* pv) {
         vTaskDelay(pdMS_TO_TICKS(50));  
         i2s_zero_dma_buffer(I2S_NUM_0);  
   
-        i2s_read(I2S_NUM_0, audio_buffer, AUDIO_BUFFER_LEN * sizeof(int16_t),  
+        i2s_read(I2S_NUM_0, (void*)audio_buffer, AUDIO_BUFFER_LEN * sizeof(int16_t),  
                  &bytesRead, portMAX_DELAY);  
   
         currentState.store(STATE_JAMMING);  
   
         float speech_prob = 0.0f;  
   
-        if (USE_TFLITE_MODEL) {  
-            if (compute_features()) {  
-                if (interpreter->Invoke() == kTfLiteOk) {  
-                    speech_prob = (output_tensor->data.int8[0] - kVadOutputZeroPoint)  
-                                  * kVadOutputScale;  
+#if USE_TFLITE_MODEL  
+        if (compute_features()) {  
+            if (interpreter->Invoke() == kTfLiteOk) {  
+                speech_prob = (output_tensor->data.int8[0] - kVadOutputZeroPoint)  
+                              * kVadOutputScale;  
   
-                    if (DEBUG_VAD) {  
-                        Serial.printf("[VAD] prob=%.3f  %s\n", speech_prob,  
-                                      (speech_prob > ACTIVE_SPEECH_THRESH) ? "SPEECH!" : "");  
-                    }  
+                if (DEBUG_VAD) {  
+                    Serial.printf("[VAD] prob=%.3f  %s\n", speech_prob,  
+                                  (speech_prob > ACTIVE_SPEECH_THRESH) ? "SPEECH!" : "");  
                 }  
             }  
+        } else {  
+            speech_prob = 0.0f;  
+            // Debugging: Print when silence/noise gate is detected
+            /*
+            Serial.println("[GATE] Silence detected, skipping inference.");
+            */
         }  
+#endif  
   
         /* === FALLBACK ENERGY DETECTOR COMMENTED OUT FOR TESTING TINYML ===  
         bool use_fallback = false;  
@@ -299,8 +265,8 @@ void AITask(void* pv) {
   
         if (use_fallback) {  
             float total_energy = 0.0f;  
-            for (int i = 0; i < AUDIO_BUFFER_LEN; ++i) {  
-                float s = static_cast<float>(audio_buffer[i]);  
+            for (int i = 0; i < AUDIO_BUFFER_LEN; i++) {  
+                float s = audio_buffer[i] / 32768.0f;  
                 total_energy += s * s;  
             }  
             float avg_energy = total_energy / AUDIO_BUFFER_LEN;  
@@ -313,8 +279,14 @@ void AITask(void* pv) {
         if (speech_prob > ACTIVE_SPEECH_THRESH) {  
             jammerAllowed.store(true);  
             lastSpeechTime = millis();  
+            vTaskDelay(pdMS_TO_TICKS(180000)); // Jam for 3 min, turned off by timer after speech ends
+            // Debugging
+            /*
+            Serial.println(">>> SPEECH DETECTED! JAMMING! <<<");
+            */
         }  
         else if (millis() - lastSpeechTime > 3000) {  
+            // If no speech has been detected for 3 seconds, turn off the jammer  
             jammerAllowed.store(false);  
             vTaskDelay(pdMS_TO_TICKS(200));  
         }  

@@ -22,7 +22,7 @@ Dual-core FreeRTOS: Core 0 handles mic capture + inference, Core 1 handles the j
 ## Pin Assignments
 
 | GPIO | Component | Signal |
-|------|-----------|--------|
+|------|-----------|-------|
 | 10 | AD9833 | FNC (chip select) |
 | 11 | AD9833 | DAT (MOSI) |
 | 12 | AD9833 | CLK (SPI clock) |
@@ -127,6 +127,22 @@ pio device monitor --baud 115200
 
 The TFLite model binary must be present in `include/vad_model_data.h` as a C array. The constants `kVadFftSize`, `kVadHopLength`, `kVadTimeFrames`, `kVadMfccFeatures`, `kVadInputScale`, `kVadInputZeroPoint`, `kVadOutputScale`, `kVadOutputZeroPoint` must match the model's quantization parameters.
 
+The firmware checks the MFCC frame layout at compile time:
+
+```cpp
+(kVadTimeFrames - 1) * kVadHopLength + kVadFftSize <= AUDIO_BUFFER_LEN
+```
+
+This prevents the last MFCC frame from reading past the 16,000-sample audio buffer. For 32 frames, a 512-point FFT, and a 16,000-sample buffer, `kVadHopLength = 480` is safe, while `kVadHopLength = 512` would require 16,384 samples and should be avoided unless the buffer is increased.
+
+---
+
+## Filtering Notes
+
+No extra software band-pass filter is required for the TinyML model to receive valid input. The firmware already converts the microphone signal into MFCC features using a Hann window, FFT, mel filterbank, logarithm, and DCT-II before inference. That MFCC pipeline acts as the feature extraction stage expected by the trained model.
+
+A separate hardware or acoustic filtering strategy may still be needed if the ultrasonic output leaks into the microphone path, clips the input stage, or aliases back into the audible/speech band. The current firmware reduces that risk by switching into `STATE_LISTENING`, pausing briefly, clearing the I2S DMA buffer, and then recording the next audio window before returning to `STATE_JAMMING`.
+
 ---
 
 ## Tuning
@@ -147,17 +163,45 @@ The TFLite model binary must be present in `include/vad_model_data.h` as a C arr
 
 ## Fallback Energy-Based Detection
 
-(Eric) To ensure robustness, the system includes a fallback to simple energy-based speech detection if TinyML inference fails or is disabled. If the VAD model cannot be loaded, inference returns an error, or `USE_TFLITE_MODEL` is set to false, the firmware computes the average signal energy over the 1-second audio buffer. If this exceeds `ENERGY_SPEECH_THRESH` (default 0.01), speech is detected, and jamming is activated. This provides basic functionality without ML, though less accurate than TinyML.
+To ensure robustness, the system includes a fallback to simple energy-based speech detection if TinyML inference fails or is disabled. If the VAD model cannot be loaded, inference returns an error, or `USE_TFLITE_MODEL` is set to false, the firmware computes the average signal energy over the 1-second audio buffer. If this exceeds `ENERGY_SPEECH_THRESH` (default 0.01), speech is detected, and jamming is activated. This provides basic functionality without ML, though less accurate than TinyML.
+
+The current firmware build is **TinyML-only**. An energy-based fallback detector is preserved in `AITask()` as a commented-out recovery/testing block, but it is not active in the current build.
+
+If fallback mode is re-enabled later, avoid calling `compute_features()` a second time in the same audio window. The intended fallback path is:
+
+1. Capture the 1-second I2S audio buffer.
+2. Try TinyML only when `USE_TFLITE_MODEL` is true and the tensors are valid.
+3. Use simple average-energy detection only when TinyML is intentionally disabled or unavailable.
 
 Tune `ENERGY_SPEECH_THRESH` by monitoring average energy during speech and noise (add Serial prints in `AITask`). Set higher to avoid false positives from ambient noise.
 
 ---
 
+## Firmware Safety Checks
+
+The updated firmware adds checks for:
+
+1. Audio buffer allocation failure.
+2. I2S driver installation failure.
+3. I2S pin configuration failure.
+4. TensorFlow Lite model schema mismatch.
+5. `AllocateTensors()` failure.
+6. Missing or incorrectly typed TFLite input/output tensors.
+7. MFCC frame layout exceeding `AUDIO_BUFFER_LEN`.
+8. Failed or incomplete I2S reads.
+9. FreeRTOS task creation failure.
+
+On fatal setup errors, the firmware prints a serial error, turns the RGB LED red, disables jamming, and halts.
+
+---
+
 ## Known Issues
 
-1. **No error checking on I2S init or `AllocateTensors()`** — failures are silent. Add return value checks if debugging initialization issues.
+1. **`currentState` race condition** — accessed across cores without atomic protection. Works in practice on 32-bit ESP32-S3 but should be `std::atomic<SystemState>`.
 
-2. **`currentState` race condition** — accessed across cores without atomic protection. Works in practice on 32-bit ESP32-S3 but should be `std::atomic<SystemState>`.
+2. **Ultrasonic leakage still needs hardware validation** — if the ultrasonic output couples back into the microphone or aliases into the speech band, add acoustic isolation, input protection, or hardware filtering. The current firmware reduces this risk by separating listening and jamming windows, but it does not prove the analog path is immune to leakage.
+
+3. **Status LED is minimal** — the RGB LED is used for fatal error indication only. It does not yet show listening, speech detected, or jamming status during normal operation.
 
 ---
 

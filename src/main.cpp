@@ -14,7 +14,21 @@
 #include "vad_model_data.h"  
   
 // =============================================================================  
-// HARDWARE PINS (Logan)  
+// CONFIG  
+// =============================================================================  
+#define I2S_BUFFER_SIZE     512  
+#define I2S_DMA_BUF_COUNT   4  
+#define AUDIO_BUFFER_LEN    16000  
+#define USE_TFLITE_MODEL    true  
+  
+#define NOISE_GATE_THRESH     0.000001f  
+#define ACTIVE_SPEECH_THRESH  0.80f  
+#define ENERGY_SPEECH_THRESH  0.01f        // kept for when you re-enable fallback  
+  
+#define DEBUG_VAD             true         // set false when not testing  
+  
+// =============================================================================  
+// PINS  
 // =============================================================================  
 #define FNC_PIN         10  
 #define DAT_PIN         11  
@@ -26,28 +40,13 @@
 #define I2S_SD_PIN      16  
   
 // =============================================================================  
-// CONFIG (Logan)  
-// =============================================================================  
-#define I2S_BUFFER_SIZE     512  
-#define I2S_DMA_BUF_COUNT   4  
-#define AUDIO_BUFFER_LEN    16000  
-#define USE_TFLITE_MODEL    true  
-  
-// Noise gate uses actual signal energy.
-#define NOISE_GATE_THRESH   0.000001f
-#define ACTIVE_SPEECH_THRESH 0.80f
-
-// Fallback energy threshold for speech detection (higher than noise gate)
-#define ENERGY_SPEECH_THRESH 0.01f  
-  
-// =============================================================================  
-// GLOBALS (Logan)  
+// GLOBALS  
 // =============================================================================  
 AD9833 gen(FNC_PIN);  
   
 enum SystemState { STATE_JAMMING, STATE_LISTENING };  
-volatile SystemState currentState = STATE_JAMMING;  
-std::atomic<bool> jammerAllowed(false);  
+std::atomic<SystemState> currentState{STATE_JAMMING};   // fixed: now atomic  
+std::atomic<bool> jammerAllowed{false};  
   
 int16_t* audio_buffer = nullptr;  
   
@@ -60,18 +59,19 @@ TfLiteTensor* output_tensor = nullptr;
   
 unsigned long lastSpeechTime = 0;  
   
-void JammerTask(void* pv);  
-void AITask(void* pv);  
-  
-// =============================================================================  
-// FFT (Logan)  
-// =============================================================================  
+// FFT buffers  
 static float tw_re[kVadFftSize / 2];  
 static float tw_im[kVadFftSize / 2];  
 static float hann[kVadFftSize];  
 static float fft_buf_re[kVadFftSize];  
 static float fft_buf_im[kVadFftSize];  
   
+void JammerTask(void* pv);  
+void AITask(void* pv);  
+  
+// =============================================================================  
+// FFT  
+// =============================================================================  
 static void fft_init() {  
     for (int k = 0; k < kVadFftSize / 2; ++k) {  
         const float ang = -2.0f * 3.14159265f * k / kVadFftSize;  
@@ -93,7 +93,6 @@ static void fft_run() {
             t = fft_buf_im[i]; fft_buf_im[i] = fft_buf_im[j]; fft_buf_im[j] = t;  
         }  
     }  
-  
     // Butterfly passes using precomputed twiddles  
     for (int len = 2; len <= kVadFftSize; len <<= 1) {  
         const int stride = kVadFftSize / len;  
@@ -113,10 +112,9 @@ static void fft_run() {
 }  
   
 // =============================================================================  
-// MFCC + Noise Gate (Logan + Eric)  
+// MFCC + Noise Gate  
 // =============================================================================  
 static bool compute_features() {  
-    // Simple energy check first  
     float total_energy = 0.0f;  
     for (int i = 0; i < AUDIO_BUFFER_LEN; ++i) {  
         float s = static_cast<float>(audio_buffer[i]);  
@@ -176,7 +174,8 @@ static bool compute_features() {
             for (int j = 0; j < kVadMfccFeatures; ++j)  
                 s += log_mel[j] * cosf(pi_over_2m * i * (2.0f * j + 1.0f));  
   
-            int q = static_cast<int>(s / kVadInputScale + kVadInputZeroPoint);  
+            // FIXED: correct int8 quantization for the model  
+            int q = (int)roundf(s / kVadInputScale) + kVadInputZeroPoint;  
             input_tensor->data.int8[frame * kVadMfccFeatures + i] = (int8_t)constrain(q, -128, 127);  
         }  
     }  
@@ -184,30 +183,24 @@ static bool compute_features() {
 }  
   
 // =============================================================================  
-// SETUP (Logan + Eric)  
+// SETUP  
 // =============================================================================  
 void setup() {  
     Serial.begin(115200);  
     delay(1000);  
-  
     neopixelWrite(RGB_LED_PIN, 0, 0, 0);  
   
-    // (Logan) Memory Allocation - prefers PSRAM  
-    audio_buffer = (int16_t*)heap_caps_malloc(AUDIO_BUFFER_LEN * sizeof(int16_t),   
+    audio_buffer = (int16_t*)heap_caps_malloc(AUDIO_BUFFER_LEN * sizeof(int16_t),  
                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);  
     if (!audio_buffer) {  
         audio_buffer = (int16_t*)malloc(AUDIO_BUFFER_LEN * sizeof(int16_t));  
     }  
-  
-    if (!audio_buffer) {  
-        while(1) delay(1000);  
-    }  
+    if (!audio_buffer) while(1) delay(1000);  
   
     SPI.begin(CLK_PIN, -1, DAT_PIN, FNC_PIN);  
     gen.begin();  
     gen.setWave(AD9833_OFF);  
   
-    // I2S setup  
     i2s_config_t i2s_config = {  
         .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),  
         .sample_rate          = 16000,  
@@ -232,14 +225,11 @@ void setup() {
   
     fft_init();  
   
-    // (Eric) TinyML setup  
     if (USE_TFLITE_MODEL) {  
         const tflite::Model* model = tflite::GetModel(vad_model_data);  
         static tflite::MicroErrorReporter error_reporter;  
         static tflite::AllOpsResolver resolver;  
-        static tflite::MicroInterpreter static_interpreter(  
-            model, resolver, tensor_arena, kArenaSize, &error_reporter);  
-          
+        static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, kArenaSize, &error_reporter);  
         interpreter = &static_interpreter;  
         interpreter->AllocateTensors();  
         input_tensor  = interpreter->input(0);  
@@ -250,18 +240,15 @@ void setup() {
     xTaskCreatePinnedToCore(AITask,     "Brain",  14000, NULL, 1, NULL, 0);  
 }  
   
-void loop() {   
-    vTaskDelete(NULL);   
-}  
+void loop() { vTaskDelete(NULL); }  
   
 // =============================================================================  
-// CORE 1 - JAMMER (Logan)  
+// JAMMER TASK (Core 1)  
 // =============================================================================  
 void JammerTask(void* pv) {  
     float currentFreq = 20000.0f;  
-  
     for (;;) {  
-        if (jammerAllowed.load() && currentState == STATE_JAMMING) {  
+        if (jammerAllowed.load() && currentState.load() == STATE_JAMMING) {  
             gen.setWave(AD9833_SINE);  
             gen.setFrequency(currentFreq, 0);  
             currentFreq += 25.0f;  
@@ -275,58 +262,61 @@ void JammerTask(void* pv) {
 }  
   
 // =============================================================================  
-// CORE 0 - AI (Logan + Eric)  
+// AI TASK (Core 0) - TinyML only (fallback commented out)  
 // =============================================================================  
 void AITask(void* pv) {  
     size_t bytesRead;  
   
     for (;;) {  
-        currentState = STATE_LISTENING;  
+        currentState.store(STATE_LISTENING);  
         vTaskDelay(pdMS_TO_TICKS(50));  
         i2s_zero_dma_buffer(I2S_NUM_0);  
   
-        i2s_read(I2S_NUM_0, audio_buffer, AUDIO_BUFFER_LEN * sizeof(int16_t),   
-                &bytesRead, portMAX_DELAY);  
+        i2s_read(I2S_NUM_0, audio_buffer, AUDIO_BUFFER_LEN * sizeof(int16_t),  
+                 &bytesRead, portMAX_DELAY);  
   
-        currentState = STATE_JAMMING;
-        float speech_prob = 0.0f;
-        bool use_fallback = false;
-
-        if (USE_TFLITE_MODEL) {
-            if (compute_features()) {
-                if (interpreter->Invoke() == kTfLiteOk) {
-                    speech_prob = (output_tensor->data.int8[0] - kVadOutputZeroPoint)
-                                  * kVadOutputScale;
-                } else {
-                    // TinyML inference failed - fall back to energy
-                    use_fallback = true;
-                }
-            }
-            // If TinyML disabled or compute_features failed (low energy), fall back
-        } else {
-            use_fallback = true;
-        }
-
-        if (use_fallback) {
-            // Fallback: Simple energy-based speech detection
-            float total_energy = 0.0f;
-            for (int i = 0; i < AUDIO_BUFFER_LEN; ++i) {
-                float s = static_cast<float>(audio_buffer[i]);
-                total_energy += s * s;
-            }
-            float avg_energy = total_energy / AUDIO_BUFFER_LEN;
-            if (avg_energy > ENERGY_SPEECH_THRESH) {
-                speech_prob = 1.0f;  // Force detection
-            }
-        }
-
-        if (speech_prob > ACTIVE_SPEECH_THRESH) {
-            jammerAllowed.store(true);
-            lastSpeechTime = millis();
-        }
-        else if (millis() - lastSpeechTime > 3000) {
-            jammerAllowed.store(false);
-            vTaskDelay(pdMS_TO_TICKS(200));
-        }
+        currentState.store(STATE_JAMMING);  
+  
+        float speech_prob = 0.0f;  
+  
+        if (USE_TFLITE_MODEL) {  
+            if (compute_features()) {  
+                if (interpreter->Invoke() == kTfLiteOk) {  
+                    speech_prob = (output_tensor->data.int8[0] - kVadOutputZeroPoint)  
+                                  * kVadOutputScale;  
+  
+                    if (DEBUG_VAD) {  
+                        Serial.printf("[VAD] prob=%.3f  %s\n", speech_prob,  
+                                      (speech_prob > ACTIVE_SPEECH_THRESH) ? "SPEECH!" : "");  
+                    }  
+                }  
+            }  
+        }  
+  
+        /* === FALLBACK ENERGY DETECTOR COMMENTED OUT FOR TESTING TINYML ===  
+        bool use_fallback = false;  
+        if (!USE_TFLITE_MODEL || !compute_features()) use_fallback = true;  
+  
+        if (use_fallback) {  
+            float total_energy = 0.0f;  
+            for (int i = 0; i < AUDIO_BUFFER_LEN; ++i) {  
+                float s = static_cast<float>(audio_buffer[i]);  
+                total_energy += s * s;  
+            }  
+            float avg_energy = total_energy / AUDIO_BUFFER_LEN;  
+            if (avg_energy > ENERGY_SPEECH_THRESH) {  
+                speech_prob = 1.0f;  
+            }  
+        }  
+        // ================================================================ */  
+  
+        if (speech_prob > ACTIVE_SPEECH_THRESH) {  
+            jammerAllowed.store(true);  
+            lastSpeechTime = millis();  
+        }  
+        else if (millis() - lastSpeechTime > 3000) {  
+            jammerAllowed.store(false);  
+            vTaskDelay(pdMS_TO_TICKS(200));  
+        }  
     }  
-}  
+}
